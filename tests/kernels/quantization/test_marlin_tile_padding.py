@@ -541,6 +541,195 @@ def test_check_marlin_supports_layer_allow_tile_padding():
     assert not check_marlin_supports_layer(layer, 128, allow_tile_padding=True)
 
 
+def test_marlin_moe_expert_gather_preserves_routes_and_rows():
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        _maybe_gather_marlin_moe_experts,
+    )
+
+    num_experts = 5
+    topk_ids = torch.tensor([[3, 3]], dtype=torch.int32)
+    weights = torch.arange(num_experts * 6).view(num_experts, 2, 3)
+    scales = torch.arange(num_experts * 2).view(num_experts, 2)
+    zero_points = 100 + scales
+    biases = 200 + scales
+    g_idx = 300 + scales
+    sort_indices = 400 + scales
+    non_expert_tensor = torch.arange(3).view(1, 3)
+
+    did_gather, remapped_ids, gathered_tensors = _maybe_gather_marlin_moe_experts(
+        topk_ids,
+        (
+            weights,
+            scales,
+            zero_points,
+            biases,
+            g_idx,
+            sort_indices,
+            non_expert_tensor,
+            None,
+        ),
+    )
+
+    assert did_gather
+    torch.testing.assert_close(remapped_ids, torch.tensor([[0, 1]], dtype=torch.int32))
+    for original, gathered in zip(
+        (weights, scales, zero_points, biases, g_idx, sort_indices),
+        gathered_tensors[:6],
+    ):
+        assert gathered is not None
+        assert gathered.shape[0] == topk_ids.numel()
+        expected = original.index_select(0, topk_ids.flatten())
+        torch.testing.assert_close(gathered, expected)
+    assert gathered_tensors[6] is non_expert_tensor
+    assert gathered_tensors[7] is None
+
+    next_ids = torch.tensor([[1, 4]], dtype=torch.int32)
+    _, next_remapped_ids, next_tensors = _maybe_gather_marlin_moe_experts(
+        next_ids,
+        (weights, scales),
+    )
+    assert next_remapped_ids.shape == remapped_ids.shape
+    assert next_tensors[0] is not None
+    assert gathered_tensors[0] is not None
+    assert next_tensors[0].shape == gathered_tensors[0].shape
+
+
+def test_marlin_moe_expert_gather_preserves_padding_routes():
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        _maybe_gather_marlin_moe_experts,
+    )
+
+    weights = torch.arange(5 * 6).view(5, 2, 3)
+    topk_ids = torch.tensor([[-1, 3]], dtype=torch.int32)
+
+    did_gather, remapped_ids, gathered_tensors = _maybe_gather_marlin_moe_experts(
+        topk_ids, (weights,)
+    )
+
+    assert did_gather
+    torch.testing.assert_close(
+        remapped_ids,
+        torch.tensor([[-1, 1]], dtype=torch.int32),
+    )
+    gathered_weights = gathered_tensors[0]
+    assert gathered_weights is not None
+    torch.testing.assert_close(gathered_weights[0], weights[0])
+    torch.testing.assert_close(gathered_weights[1], weights[3])
+
+
+def test_marlin_moe_expert_gather_falls_back_for_all_experts():
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        _maybe_gather_marlin_moe_experts,
+    )
+
+    weights = torch.randn(4, 2, 3)
+    scales = torch.randn(4, 2)
+    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+    did_gather, returned_ids, returned_tensors = _maybe_gather_marlin_moe_experts(
+        topk_ids, (weights, scales)
+    )
+
+    assert not did_gather
+    assert returned_ids is topk_ids
+    assert returned_tensors[0] is weights
+    assert returned_tensors[1] is scales
+
+
+@pytest.mark.parametrize("enable_gather", [False, True], ids=["disabled", "enabled"])
+def test_marlin_moe_expert_gather_apply_respects_env(monkeypatch, enable_gather):
+    import vllm.envs as envs
+    import vllm.model_executor.layers.fused_moe.experts.marlin_moe as marlin_moe
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+
+    if enable_gather:
+        monkeypatch.setenv("VLLM_MARLIN_MOE_EXPERT_GATHER", "1")
+    else:
+        monkeypatch.delenv("VLLM_MARLIN_MOE_EXPERT_GATHER", raising=False)
+    assert envs.VLLM_MARLIN_MOE_EXPERT_GATHER is enable_gather
+
+    num_experts = 4
+    w1_scale = torch.arange(num_experts).view(num_experts, 1).float()
+    w2_scale = 10 + w1_scale
+    quant_config = FusedMoEQuantConfig.make(
+        weight_dtype="int4",
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+    )
+    experts = object.__new__(marlin_moe.MarlinExperts)
+    experts.quant_config = quant_config
+    experts.moe_config = SimpleNamespace(
+        is_lora_enabled=False,
+        activation_situ_beta=None,
+        activation_situ_linear_beta=None,
+        moe_parallel_config=SimpleNamespace(
+            tp_size=1,
+            pcp_size=1,
+            dp_size=1,
+            ep_size=1,
+            sp_size=1,
+        ),
+    )
+    experts.enable_expert_gather = envs.VLLM_MARLIN_MOE_EXPERT_GATHER
+    experts.w13_g_idx = None
+    experts.w2_g_idx = None
+    experts.w13_g_idx_sort_indices = None
+    experts.w2_g_idx_sort_indices = None
+    experts.is_k_full = True
+    experts.input_dtype = None
+    experts.gemm1_clamp_limit = None
+    experts.gemm1_alpha = 1.0
+    experts.gemm1_beta = 0.0
+
+    captured = {}
+
+    def fake_fused_marlin_moe(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(marlin_moe, "fused_marlin_moe", fake_fused_marlin_moe)
+    w1 = torch.randn(num_experts, 2, 3)
+    w2 = torch.randn(num_experts, 2, 3)
+    if enable_gather:
+        w1._vllm_is_uva_offloaded = True
+        w2._vllm_is_uva_offloaded = True
+    topk_ids = torch.tensor([[2, 2]], dtype=torch.int32)
+    experts.apply(
+        output=torch.empty(1, 3),
+        hidden_states=torch.randn(1, 3),
+        w1=w1,
+        w2=w2,
+        topk_weights=torch.ones(1, 2),
+        topk_ids=topk_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=num_experts,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=torch.empty(1),
+        workspace2=torch.empty(1),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    if enable_gather:
+        expert_indices = topk_ids.flatten()
+        torch.testing.assert_close(captured["w1"], w1.index_select(0, expert_indices))
+        torch.testing.assert_close(captured["w2"], w2.index_select(0, expert_indices))
+        torch.testing.assert_close(
+            captured["w1_scale"], w1_scale.index_select(0, expert_indices)
+        )
+        torch.testing.assert_close(
+            captured["topk_ids"], torch.tensor([[0, 1]], dtype=torch.int32)
+        )
+        assert captured["global_num_experts"] == topk_ids.numel()
+    else:
+        assert captured["w1"] is w1
+        assert captured["w2"] is w2
+        assert captured["topk_ids"] is topk_ids
+        assert captured["global_num_experts"] == num_experts
+
+
 @pytest.mark.skipif(
     _gpu_marlin_unsupported(),
     reason="Marlin is not supported on this GPU type.",

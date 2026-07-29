@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    _maybe_gather_marlin_moe_experts,
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
@@ -58,7 +59,10 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 from vllm.triton_utils import tl
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import (
+    get_accelerator_view_from_cpu_tensor,
+    set_random_seed,
+)
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -903,6 +907,194 @@ class MarlinMoEWeightData:
             zeros=zeros,
             sort_indices=sort_indices,
             marlin_bias=marlin_bias,
+        )
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.usefixtures("default_vllm_config")
+def test_marlin_moe_expert_gather_uva_matches_full_experts(group_size):
+    """Compare routed UVA gathers with the full-expert Marlin path."""
+    set_random_seed(0)
+    num_experts = 8
+    hidden_size, intermediate_size = 256, 128
+    dtype = torch.float16
+
+    hidden_states = torch.randn(
+        (2, hidden_size),
+        device="cuda",
+        dtype=dtype,
+    )
+    w1 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device="cuda",
+        dtype=dtype,
+    )
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device="cuda",
+        dtype=dtype,
+    )
+    w1_data = MarlinMoEWeightData.make(
+        w=w1,
+        quant_type=scalar_types.uint4b8,
+        group_size=group_size,
+        act_order=False,
+    )
+    w2_data = MarlinMoEWeightData.make(
+        w=w2,
+        quant_type=scalar_types.uint4b8,
+        group_size=group_size,
+        act_order=False,
+    )
+    topk_ids = torch.tensor(
+        [[2, 2], [-1, -1]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_weights = torch.tensor(
+        [[0.6, 0.4], [0.0, 0.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expert_tensors = (
+        w1_data.qweight,
+        w2_data.qweight,
+        w1_data.marlin_bias,
+        w2_data.marlin_bias,
+        w1_data.scales,
+        w2_data.scales,
+        w1_data.global_scale,
+        w2_data.global_scale,
+        w1_data.a_scales_factor,
+        w2_data.a_scales_factor,
+        w1_data.zeros,
+        w2_data.zeros,
+        w1_data.g_idx,
+        w2_data.g_idx,
+        w1_data.sort_indices,
+        w2_data.sort_indices,
+    )
+
+    # Keep the pinned owners alive through graph replay.
+    pinned_expert_tensors: list[torch.Tensor] = []
+    uva_expert_tensors: list[torch.Tensor | None] = []
+    for tensor in expert_tensors:
+        if tensor is not None and tensor.ndim > 0 and tensor.size(0) == num_experts:
+            pinned_tensor = tensor.cpu().pin_memory()
+            pinned_expert_tensors.append(pinned_tensor)
+            uva_expert_tensors.append(
+                get_accelerator_view_from_cpu_tensor(pinned_tensor)
+            )
+        else:
+            uva_expert_tensors.append(tensor)
+
+    def run_marlin(
+        routed_ids: torch.Tensor,
+        tensors: tuple[torch.Tensor | None, ...],
+        global_num_experts: int,
+    ) -> torch.Tensor:
+        (
+            w1_weight,
+            w2_weight,
+            w1_bias,
+            w2_bias,
+            w1_scale,
+            w2_scale,
+            global_scale1,
+            global_scale2,
+            input_global_scale1,
+            input_global_scale2,
+            w1_zeros,
+            w2_zeros,
+            g_idx1,
+            g_idx2,
+            sort_indices1,
+            sort_indices2,
+        ) = tensors
+        assert w1_weight is not None
+        assert w2_weight is not None
+        assert w1_scale is not None
+        assert w2_scale is not None
+        return fused_marlin_moe(
+            hidden_states,
+            w1_weight,
+            w2_weight,
+            w1_bias,
+            w2_bias,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            routed_ids,
+            global_scale1=global_scale1,
+            global_scale2=global_scale2,
+            input_global_scale1=input_global_scale1,
+            input_global_scale2=input_global_scale2,
+            w1_zeros=w1_zeros,
+            w2_zeros=w2_zeros,
+            g_idx1=g_idx1,
+            g_idx2=g_idx2,
+            sort_indices1=sort_indices1,
+            sort_indices2=sort_indices2,
+            quant_type_id=scalar_types.uint4b8.id,
+            global_num_experts=global_num_experts,
+            is_k_full=True,
+        )
+
+    baseline_output = run_marlin(topk_ids, expert_tensors, num_experts)
+    did_gather, remapped_ids, gathered_tensors = _maybe_gather_marlin_moe_experts(
+        topk_ids,
+        tuple(uva_expert_tensors),
+    )
+    assert did_gather
+    selective_output = run_marlin(
+        remapped_ids,
+        gathered_tensors,
+        remapped_ids.numel(),
+    )
+    valid_tokens = (topk_ids >= 0).any(dim=-1)
+    torch.testing.assert_close(
+        selective_output[valid_tokens],
+        baseline_output[valid_tokens],
+        atol=5e-2,
+        rtol=0,
+    )
+
+    if group_size != 128:
+        return
+
+    static_ids = topk_ids.clone()
+    graph = torch.cuda.CUDAGraph()
+    torch.accelerator.synchronize()
+    with torch.cuda.graph(graph):
+        _, captured_ids, captured_tensors = _maybe_gather_marlin_moe_experts(
+            static_ids,
+            tuple(uva_expert_tensors),
+        )
+        captured_output = run_marlin(
+            captured_ids,
+            captured_tensors,
+            captured_ids.numel(),
+        )
+
+    for replay_ids in (
+        torch.tensor([[2, 2], [-1, -1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[1, 5], [-1, -1]], dtype=torch.int32, device="cuda"),
+    ):
+        static_ids.copy_(replay_ids)
+        graph.replay()
+        replay_output = captured_output.clone()
+        baseline_replay_output = run_marlin(
+            replay_ids,
+            expert_tensors,
+            num_experts,
+        )
+        valid_tokens = (replay_ids >= 0).any(dim=-1)
+        torch.testing.assert_close(
+            replay_output[valid_tokens],
+            baseline_replay_output[valid_tokens],
+            atol=5e-2,
+            rtol=0,
         )
 
 

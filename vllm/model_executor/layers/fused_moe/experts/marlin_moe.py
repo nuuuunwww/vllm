@@ -8,7 +8,9 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -52,6 +54,40 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+logger = init_logger(__name__)
+
+
+def _maybe_gather_marlin_moe_experts(
+    topk_ids: torch.Tensor,
+    expert_tensors: tuple[torch.Tensor | None, ...],
+) -> tuple[bool, torch.Tensor, tuple[torch.Tensor | None, ...]]:
+    first_expert_tensor = expert_tensors[0]
+    assert first_expert_tensor is not None
+    num_experts = first_expert_tensor.size(0)
+    if topk_ids.numel() >= num_experts:
+        return False, topk_ids, expert_tensors
+
+    expert_indices = topk_ids.flatten()
+    valid_experts = expert_indices >= 0
+    gather_indices = expert_indices.clamp_min(0)
+    gathered_tensors = tuple(
+        tensor.index_select(0, gather_indices)
+        if tensor is not None and tensor.ndim > 0 and tensor.size(0) == num_experts
+        else tensor
+        for tensor in expert_tensors
+    )
+    remapped_topk_ids = torch.arange(
+        expert_indices.numel(),
+        device=topk_ids.device,
+        dtype=topk_ids.dtype,
+    ).view_as(topk_ids)
+    remapped_topk_ids = torch.where(
+        valid_experts.view_as(topk_ids),
+        remapped_topk_ids,
+        -1,
+    )
+    return True, remapped_topk_ids, gathered_tensors
 
 
 def _fused_marlin_moe(
@@ -612,6 +648,7 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.gemm1_beta = (
             quant_config.gemm1_beta if quant_config.gemm1_beta is not None else 0.0
         )
+        self.enable_expert_gather = envs.VLLM_MARLIN_MOE_EXPERT_GATHER
 
         super().__init__(
             moe_config=moe_config,
@@ -725,6 +762,47 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
 class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     """Marlin-based fused MoE expert implementation."""
 
+    def _expert_gather_incompatibility(
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        expert_tensors: tuple[torch.Tensor | None, ...],
+    ) -> str | None:
+        if not (self.quant_config.use_int4_w4a16 or self.quant_config.use_int8_w8a16):
+            return "only W4A16 and W8A16 Marlin are supported"
+
+        parallel_config = self.moe_config.moe_parallel_config
+        if (
+            parallel_config.tp_size != 1
+            or parallel_config.pcp_size != 1
+            or parallel_config.dp_size != 1
+            or parallel_config.ep_size != 1
+            or parallel_config.sp_size != 1
+        ):
+            return "only single-GPU execution is supported"
+        if expert_map is not None:
+            return "expert_map is not supported"
+        if global_num_experts not in (-1, w1.size(0)):
+            return "global and local expert counts must match"
+        if self.moe_config.is_lora_enabled or self._lora_context is not None:
+            return "MoE LoRA is not supported"
+        if not (
+            getattr(w1, "_vllm_is_uva_offloaded", False)
+            and getattr(w2, "_vllm_is_uva_offloaded", False)
+        ):
+            return "w1 and w2 must be UVA-offloaded"
+        if any(
+            tensor is not None
+            and tensor.ndim > 0
+            and tensor.size(0) == w1.size(0)
+            and tensor.device != w1.device
+            for tensor in expert_tensors
+        ):
+            return "expert tensors must share the Marlin weight device"
+        return None
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -786,23 +864,94 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         assert self.w2_scale is not None
 
         ctx = self._lora_context
+        if self.enable_expert_gather and ctx is not None:
+            logger.warning_once(
+                "VLLM_MARLIN_MOE_EXPERT_GATHER is enabled but inactive: "
+                "MoE LoRA is not supported."
+            )
         if ctx is None:
+            expert_tensors: tuple[torch.Tensor | None, ...] = (
+                w1,
+                w2,
+                self.w1_bias,
+                self.w2_bias,
+                self.w1_scale,
+                self.w2_scale,
+                self.g1_alphas,
+                self.g2_alphas,
+                self.a1_gscale,
+                self.a2_gscale,
+                self.w1_zp,
+                self.w2_zp,
+                self.w13_g_idx,
+                self.w2_g_idx,
+                self.w13_g_idx_sort_indices,
+                self.w2_g_idx_sort_indices,
+            )
+            gathered = False
+            if self.enable_expert_gather:
+                incompatibility = self._expert_gather_incompatibility(
+                    w1,
+                    w2,
+                    global_num_experts,
+                    expert_map,
+                    expert_tensors,
+                )
+                if incompatibility is not None:
+                    logger.warning_once(
+                        "VLLM_MARLIN_MOE_EXPERT_GATHER is enabled but inactive "
+                        "for this layer: %s.",
+                        incompatibility,
+                    )
+                else:
+                    gathered, topk_ids, expert_tensors = (
+                        _maybe_gather_marlin_moe_experts(
+                            topk_ids,
+                            expert_tensors,
+                        )
+                    )
+                    if gathered:
+                        global_num_experts = topk_ids.numel()
+                        expert_map = None
+
+            (
+                w1,
+                w2,
+                bias1,
+                bias2,
+                w1_scale,
+                w2_scale,
+                global_scale1,
+                global_scale2,
+                input_global_scale1,
+                input_global_scale2,
+                w1_zeros,
+                w2_zeros,
+                g_idx1,
+                g_idx2,
+                sort_indices1,
+                sort_indices2,
+            ) = expert_tensors
+            assert w1 is not None
+            assert w2 is not None
+            assert w1_scale is not None
+            assert w2_scale is not None
             fused_marlin_moe(
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
-                bias1=self.w1_bias,
-                bias2=self.w2_bias,
-                w1_scale=self.w1_scale,
-                w2_scale=self.w2_scale,
+                bias1=bias1,
+                bias2=bias2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                global_scale1=self.g1_alphas,
-                global_scale2=self.g2_alphas,
-                input_global_scale1=self.a1_gscale,
-                input_global_scale2=self.a2_gscale,
-                w1_zeros=self.w1_zp,
-                w2_zeros=self.w2_zp,
+                global_scale1=global_scale1,
+                global_scale2=global_scale2,
+                input_global_scale1=input_global_scale1,
+                input_global_scale2=input_global_scale2,
+                w1_zeros=w1_zeros,
+                w2_zeros=w2_zeros,
                 quant_type_id=self.quant_type_id,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
@@ -819,10 +968,10 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 # output buffer allocation. Please refer to workspace_shapes().
                 intermediate_cache13=workspace2,
                 intermediate_cache2=workspace13,
-                g_idx1=self.w13_g_idx,
-                g_idx2=self.w2_g_idx,
-                sort_indices1=self.w13_g_idx_sort_indices,
-                sort_indices2=self.w2_g_idx_sort_indices,
+                g_idx1=g_idx1,
+                g_idx2=g_idx2,
+                sort_indices1=sort_indices1,
+                sort_indices2=sort_indices2,
                 is_k_full=self.is_k_full,
                 input_dtype=self.input_dtype,
                 clamp_limit=self.gemm1_clamp_limit,
@@ -1045,6 +1194,11 @@ class BatchedMarlinExperts(MarlinExpertsBase):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if self.enable_expert_gather:
+            logger.warning_once(
+                "VLLM_MARLIN_MOE_EXPERT_GATHER is enabled but inactive: "
+                "the batched Marlin path is not supported."
+            )
         assert expert_tokens_meta is not None, "Num valid tokens per batch is required"
 
         def activation_func(
