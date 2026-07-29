@@ -280,6 +280,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_MARLIN_MOE_EXPERT_GATHER: bool = False
+    VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE: int = 0
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
@@ -1958,6 +1959,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MARLIN_MOE_EXPERT_GATHER": lambda: bool(
         int(os.getenv("VLLM_MARLIN_MOE_EXPERT_GATHER", "0"))
     ),
+    # Repack UVA-offloaded GPTQ Marlin MoE weights in bounded expert chunks.
+    "VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE", "0")
+    ),
     # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
     # supported but disabled by default due to a small performance regression.
     # Set to 1 when pinned memory or UVA is required (e.g. CPU offloading
@@ -2191,6 +2196,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",
+        "VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE",
         "VLLM_TEST_FORCE_LOAD_FORMAT",
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",

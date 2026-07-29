@@ -47,6 +47,17 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 logger = init_logger(__name__)
 
 
+def _replace_parameter_preserving_uva(
+    layer: torch.nn.Module,
+    name: str,
+    data: torch.Tensor,
+) -> None:
+    is_uva_offloaded = getattr(data, "_vllm_is_uva_offloaded", False)
+    replace_parameter(layer, name, data)
+    if is_uva_offloaded:
+        getattr(layer, name)._vllm_is_uva_offloaded = True
+
+
 class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self,
@@ -462,8 +473,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         ) = converted
 
         # Replace common parameters
-        replace_parameter(layer, "w13_weight_packed", w13_qweight)
-        replace_parameter(layer, "w2_weight_packed", w2_qweight)
+        _replace_parameter_preserving_uva(layer, "w13_weight_packed", w13_qweight)
+        _replace_parameter_preserving_uva(layer, "w2_weight_packed", w2_qweight)
         replace_parameter(layer, "w13_weight_scale", w13_scales)
         replace_parameter(layer, "w2_weight_scale", w2_scales)
 

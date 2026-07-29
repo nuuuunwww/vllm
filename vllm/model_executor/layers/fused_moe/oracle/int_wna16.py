@@ -10,6 +10,7 @@ from compressed_tensors.quantization import (
 )
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
@@ -43,6 +44,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import empty_accelerator_view_from_host
 
 logger = init_logger(__name__)
 
@@ -503,6 +505,100 @@ def _pad_w13_bias(bias: torch.Tensor, n: int, padded_n: int) -> torch.Tensor:
     return bias.reshape(e, 2 * padded_n).contiguous()
 
 
+def _marlin_moe_repack_chunking_reason(
+    chunk_size: int,
+    input_dtype: torch.dtype | None,
+    actorder: str | None,
+    w13_qweight: torch.Tensor,
+    w2_qweight: torch.Tensor,
+    intermediate_size: int,
+    padded_intermediate_size: int,
+) -> str | None:
+    if chunk_size <= 0:
+        return "the chunk size must be positive"
+    if not current_platform.is_cuda():
+        return "only the CUDA Marlin backend is supported"
+    if w13_qweight.device.type != "cuda" or w2_qweight.device.type != "cuda":
+        return "the packed weights are not CUDA UVA views"
+    if not (
+        getattr(w13_qweight, "_vllm_is_uva_offloaded", False)
+        and getattr(w2_qweight, "_vllm_is_uva_offloaded", False)
+    ):
+        return "both packed weights must be UVA-offloaded"
+    if input_dtype == torch.float8_e4m3fn:
+        return "FP8 activation preprocessing is unsupported"
+    if actorder == "group":
+        return "activation-order repacking is unsupported"
+    if padded_intermediate_size != intermediate_size:
+        return "Marlin intermediate-size padding is unsupported"
+    return None
+
+
+def _compressed_tensors_chunking_reason(
+    backend: WNA16MoEBackend,
+    quant_config: QuantizationConfig | QuantizationArgs | None,
+    input_dtype: torch.dtype | None,
+    w13_qzeros: torch.Tensor | None,
+    w2_qzeros: torch.Tensor | None,
+    w13_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+) -> str | None:
+    if backend != WNA16MoEBackend.MARLIN:
+        return "only the non-batched Marlin backend is supported"
+    if not isinstance(quant_config, QuantizationArgs):
+        return "only compressed-tensors weights are supported"
+    if (
+        quant_config.num_bits != 4
+        or not quant_config.symmetric
+        or quant_config.group_size != 128
+    ):
+        return "only symmetric W4A16 weights with group_size=128 are supported"
+    if input_dtype is not None:
+        return "only A16 inputs without preprocessing are supported"
+    if quant_config.actorder is not None:
+        return "activation ordering is unsupported"
+    if w13_qzeros is not None or w2_qzeros is not None:
+        return "zero points are unsupported"
+    if w13_bias is not None or w2_bias is not None:
+        return "expert bias is unsupported"
+    return None
+
+
+def _gptq_marlin_moe_repack_uva(
+    qweight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+    chunk_size: int,
+    is_a_8bit: bool,
+) -> torch.Tensor:
+    with torch.accelerator.device_index(qweight.device.index):
+        output = empty_accelerator_view_from_host(
+            (
+                qweight.shape[0],
+                size_k // 16,
+                size_n * (num_bits // 2),
+            ),
+            qweight.dtype,
+        )
+        try:
+            ops.gptq_marlin_moe_repack_into(
+                qweight,
+                perm,
+                size_k,
+                size_n,
+                num_bits,
+                output,
+                chunk_size,
+                is_a_8bit,
+            )
+        finally:
+            torch.accelerator.synchronize(qweight.device)
+    output._vllm_is_uva_offloaded = True
+    return output
+
+
 def _process_weights_marlin(
     layer: torch.nn.Module,
     input_dtype: torch.dtype | None,
@@ -520,6 +616,7 @@ def _process_weights_marlin(
     w2_qzeros: torch.Tensor | None = None,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    repack_chunk_size: int = 0,
 ) -> tuple[
     torch.Tensor,  # w13_qweight
     torch.Tensor,  # w2_qweight
@@ -578,6 +675,30 @@ def _process_weights_marlin(
     # Act-order keeps the strict shape and is never padded.
     N = layer.intermediate_size_per_partition
     padded_N = marlin_moe_padded_intermediate(N, group_size)
+    chunk_size = repack_chunk_size
+    chunking_reason: str | None = None
+    if chunk_size != 0:
+        chunking_reason = _marlin_moe_repack_chunking_reason(
+            chunk_size,
+            input_dtype,
+            actorder,
+            w13_qweight,
+            w2_qweight,
+            N,
+            padded_N,
+        )
+        if chunking_reason is not None:
+            logger.warning_once(
+                "VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE=%d is inactive: %s. "
+                "Falling back to the standard Marlin MoE repack.",
+                chunk_size,
+                chunking_reason,
+            )
+        else:
+            logger.info_once(
+                "Repacking UVA-offloaded Marlin MoE weights in chunks of %d experts.",
+                chunk_size,
+            )
     if padded_N != N:
         assert actorder != "group", (
             "Marlin MoE thread-tile padding is unsupported with act-order"
@@ -631,22 +752,42 @@ def _process_weights_marlin(
         )
 
     # --- Repack weights ---
-    marlin_w13_qweight = ops.gptq_marlin_moe_repack(
-        marlin_w13_qweight,
-        w13_g_idx_sort_indices,
-        marlin_w13_qweight.shape[1] * pack_factor,
-        marlin_w13_qweight.shape[2],
-        num_bits,
-        is_a_8bit=is_a_8bit,
-    )
-    marlin_w2_qweight = ops.gptq_marlin_moe_repack(
-        marlin_w2_qweight,
-        w2_g_idx_sort_indices,
-        marlin_w2_qweight.shape[1] * pack_factor,
-        marlin_w2_qweight.shape[2],
-        num_bits,
-        is_a_8bit=is_a_8bit,
-    )
+    if chunk_size > 0 and chunking_reason is None:
+        marlin_w13_qweight = _gptq_marlin_moe_repack_uva(
+            marlin_w13_qweight,
+            w13_g_idx_sort_indices,
+            marlin_w13_qweight.shape[1] * pack_factor,
+            marlin_w13_qweight.shape[2],
+            num_bits,
+            chunk_size,
+            is_a_8bit,
+        )
+        marlin_w2_qweight = _gptq_marlin_moe_repack_uva(
+            marlin_w2_qweight,
+            w2_g_idx_sort_indices,
+            marlin_w2_qweight.shape[1] * pack_factor,
+            marlin_w2_qweight.shape[2],
+            num_bits,
+            chunk_size,
+            is_a_8bit,
+        )
+    else:
+        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+            marlin_w13_qweight,
+            w13_g_idx_sort_indices,
+            marlin_w13_qweight.shape[1] * pack_factor,
+            marlin_w13_qweight.shape[2],
+            num_bits,
+            is_a_8bit=is_a_8bit,
+        )
+        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+            marlin_w2_qweight,
+            w2_g_idx_sort_indices,
+            marlin_w2_qweight.shape[1] * pack_factor,
+            marlin_w2_qweight.shape[2],
+            num_bits,
+            is_a_8bit=is_a_8bit,
+        )
 
     # --- Permute scales ---
     marlin_w13_scales = marlin_moe_permute_scales(
@@ -1423,6 +1564,32 @@ def convert_to_wna16_moe_kernel_format(
         quant_config: the ``QuantizationConfig`` for this layer.
         input_dtype: optional activation dtype, usually should be 16 bit.
     """
+    chunk_size = envs.VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE
+    marlin_backends = (
+        WNA16MoEBackend.MARLIN,
+        WNA16MoEBackend.BATCHED_MARLIN,
+    )
+    repack_chunk_size = 0
+    if chunk_size != 0:
+        chunking_reason = _compressed_tensors_chunking_reason(
+            backend,
+            quant_config,
+            input_dtype,
+            w13_qzeros,
+            w2_qzeros,
+            w13_bias,
+            w2_bias,
+        )
+        if chunking_reason is None:
+            repack_chunk_size = chunk_size
+        else:
+            logger.warning_once(
+                "VLLM_MARLIN_MOE_REPACK_CHUNK_SIZE=%d is inactive: %s. "
+                "Falling back to the standard weight conversion.",
+                chunk_size,
+                chunking_reason,
+            )
+
     if backend == WNA16MoEBackend.HUMMING:
         from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
@@ -1447,10 +1614,7 @@ def convert_to_wna16_moe_kernel_format(
             )
         return None
 
-    if backend in (
-        WNA16MoEBackend.MARLIN,
-        WNA16MoEBackend.BATCHED_MARLIN,
-    ):
+    if backend in marlin_backends:
         from vllm.model_executor.layers.quantization.auto_awq import (
             AutoAWQConfig,
         )
@@ -1518,6 +1682,7 @@ def convert_to_wna16_moe_kernel_format(
                 w2_qzeros,
                 w13_bias,
                 w2_bias,
+                repack_chunk_size=repack_chunk_size,
             )
     elif backend == WNA16MoEBackend.CPU:
         return _process_weights_cpu(

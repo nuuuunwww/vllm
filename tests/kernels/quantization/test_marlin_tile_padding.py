@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils.platform_utils import is_uva_available
 
 # (size_n, size_k) rank-local shapes that violate Marlin tile alignment,
 # e.g. produced by TP-sharding dims that are valid at TP=1.
@@ -189,6 +190,14 @@ def test_marlin_moe_pad_helpers_shapes():
 def _gpu_marlin_unsupported() -> bool:
     return not (
         current_platform.is_cuda() and current_platform.has_device_capability(80)
+    )
+
+
+def _gpu_marlin_repack_unsupported() -> bool:
+    return not (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(75)
+        and is_uva_available()
     )
 
 
@@ -728,6 +737,49 @@ def test_marlin_moe_expert_gather_apply_respects_env(monkeypatch, enable_gather)
         assert captured["w2"] is w2
         assert captured["topk_ids"] is topk_ids
         assert captured["global_num_experts"] == num_experts
+
+
+@pytest.mark.skipif(
+    _gpu_marlin_repack_unsupported(),
+    reason="Marlin is not supported on this GPU type.",
+)
+def test_gptq_marlin_moe_chunked_repack_matches_full_repack_cuda():
+    from vllm.utils.torch_utils import empty_accelerator_view_from_host
+
+    num_experts = 5
+    size_k = 128
+    size_n = 64
+    num_bits = 4
+    pack_factor = 32 // num_bits
+    qweight = torch.randint(
+        torch.iinfo(torch.int32).min,
+        torch.iinfo(torch.int32).max,
+        (num_experts, size_k // pack_factor, size_n),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    perm = torch.empty((num_experts, 0), dtype=torch.int32, device="cuda")
+    expected = ops.gptq_marlin_moe_repack(
+        qweight,
+        perm,
+        size_k,
+        size_n,
+        num_bits,
+    )
+    output = empty_accelerator_view_from_host(expected.shape, expected.dtype)
+
+    ops.gptq_marlin_moe_repack_into(
+        qweight,
+        perm,
+        size_k,
+        size_n,
+        num_bits,
+        output,
+        chunk_size=2,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(output, expected)
 
 
 @pytest.mark.skipif(

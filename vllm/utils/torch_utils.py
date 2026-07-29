@@ -5,7 +5,7 @@ import importlib.metadata
 import os
 import random
 import threading
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -779,6 +779,27 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
             f"`get_accelerator_view_from_cpu_tensor` is currently "
             f"not supported in: {current_platform.device_name}"
         )
+
+
+def empty_accelerator_view_from_host(
+    size: int | Sequence[int], dtype: torch.dtype
+) -> torch.Tensor:
+    """Allocate an uninitialized contiguous UVA tensor in mapped host memory.
+
+    The returned tensor is associated with the current CUDA device. Callers
+    using multiple devices must select the device before allocating.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda_alike():
+        raise ValueError(
+            f"`empty_accelerator_view_from_host` is currently "
+            f"not supported in: {current_platform.device_name}"
+        )
+
+    sizes = [size] if isinstance(size, int) else list(size)
+    dtype_template = torch.empty(0, dtype=dtype, device="cpu")
+    return torch.ops._C.empty_cuda_view_from_host(dtype_template, sizes)
 
 
 # Helper function used in testing.

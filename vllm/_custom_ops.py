@@ -1167,6 +1167,54 @@ def gptq_marlin_moe_repack(
     return output
 
 
+def gptq_marlin_moe_repack_into(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+    output: torch.Tensor,
+    chunk_size: int,
+    is_a_8bit: bool = False,
+) -> torch.Tensor:
+    """Repack MoE experts in bounded chunks into a caller-owned tensor."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+
+    expected_shape = (
+        b_q_weight.shape[0],
+        size_k // 16,
+        size_n * (num_bits // 2),
+    )
+    if output.shape != expected_shape:
+        raise ValueError(
+            f"output has shape {tuple(output.shape)}, expected {expected_shape}."
+        )
+    if (
+        output.dtype != b_q_weight.dtype
+        or output.device != b_q_weight.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be a contiguous tensor on the weight device with "
+            "the weight dtype."
+        )
+
+    num_experts = b_q_weight.shape[0]
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        chunk = gptq_marlin_moe_repack(
+            b_q_weight[start:end],
+            perm[start:end],
+            size_k,
+            size_n,
+            num_bits,
+            is_a_8bit,
+        )
+        output[start:end].copy_(chunk)
+    return output
+
+
 def awq_marlin_moe_repack(
     b_q_weight: torch.Tensor,
     perm: torch.Tensor,

@@ -30,6 +30,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
 
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
+  ops.def(
+      "empty_cuda_view_from_host(Tensor dtype_template, int[] sizes) -> "
+      "Tensor");
 
 #ifndef USE_ROCM
 
@@ -832,6 +835,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 STABLE_TORCH_LIBRARY_IMPL(_C, CPU, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor",
            TORCH_BOX(&get_cuda_view_from_cpu_tensor));
+  ops.impl("empty_cuda_view_from_host", TORCH_BOX(&empty_cuda_view_from_host));
 }
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C_cuda_utils, cuda_utils) {

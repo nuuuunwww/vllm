@@ -8,7 +8,22 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <limits>
+#include <memory>
 #include <optional>
+#include <vector>
+
+namespace {
+
+struct CudaHostDeleter {
+  void operator()(void* ptr) const {
+    if (ptr != nullptr) {
+      cudaFreeHost(ptr);
+    }
+  }
+};
+
+}  // namespace
 
 // This function assumes that `cpu_tensor` is a CPU tensor,
 // and that UVA (Unified Virtual Addressing) is enabled.
@@ -73,4 +88,68 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
   return torch::stable::from_blob(device_ptr, contiguous_cpu.sizes(),
                                   contiguous_cpu.strides(), cuda_dev,
                                   contiguous_cpu.scalar_type(), deleter);
+}
+
+torch::stable::Tensor empty_cuda_view_from_host(
+    torch::stable::Tensor& dtype_template, const std::vector<int64_t>& sizes) {
+  STD_TORCH_CHECK(dtype_template.device().is_cpu(),
+                  "dtype_template must be on CPU");
+  STD_TORCH_CHECK(dtype_template.numel() == 0,
+                  "dtype_template must have zero elements");
+
+  const auto dtype = dtype_template.scalar_type();
+  const auto layout = dtype_template.layout();
+  int current_device = -1;
+  cudaError_t err = cudaGetDevice(&current_device);
+  STD_TORCH_CHECK(err == cudaSuccess,
+                  "cudaGetDevice failed: ", cudaGetErrorString(err));
+  const torch::stable::Device cuda_dev(
+      torch::headeronly::DeviceType::CUDA,
+      static_cast<torch::stable::DeviceIndex>(current_device));
+
+  int64_t numel = 1;
+  for (const int64_t size : sizes) {
+    STD_TORCH_CHECK(size >= 0, "Tensor dimensions must be non-negative");
+    if (numel == 0 || size == 0) {
+      numel = 0;
+      continue;
+    }
+    STD_TORCH_CHECK(numel <= std::numeric_limits<int64_t>::max() / size,
+                    "Tensor size overflow");
+    numel *= size;
+  }
+
+  if (numel == 0) {
+    return torch::stable::empty(sizes, dtype, layout, cuda_dev);
+  }
+
+  const size_t element_size = dtype_template.element_size();
+  STD_TORCH_CHECK(static_cast<uint64_t>(numel) <=
+                      std::numeric_limits<size_t>::max() / element_size,
+                  "Tensor byte size overflow");
+  const size_t nbytes = static_cast<size_t>(numel) * element_size;
+
+  void* host_ptr = nullptr;
+  err = cudaHostAlloc(&host_ptr, nbytes, cudaHostAllocMapped);
+  STD_TORCH_CHECK(err == cudaSuccess,
+                  "cudaHostAlloc failed: ", cudaGetErrorString(err));
+  std::unique_ptr<void, CudaHostDeleter> allocation(host_ptr);
+
+  void* device_ptr = nullptr;
+  err = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
+  STD_TORCH_CHECK(err == cudaSuccess,
+                  "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
+
+  std::vector<int64_t> strides(sizes.size());
+  int64_t stride = 1;
+  for (size_t i = sizes.size(); i > 0; --i) {
+    strides[i - 1] = stride;
+    stride *= sizes[i - 1];
+  }
+
+  auto deleter = [host_ptr](void*) { cudaFreeHost(host_ptr); };
+  auto result = torch::stable::from_blob(device_ptr, sizes, strides, cuda_dev,
+                                         dtype, deleter);
+  allocation.release();
+  return result;
 }

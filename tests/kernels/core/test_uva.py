@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
+
 import pytest
 import torch
 
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    empty_accelerator_view_from_host,
+    get_accelerator_view_from_cpu_tensor,
+)
 
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
@@ -53,3 +58,25 @@ def test_gpu_write(device):
     assert cpu_tensor[0, 0] == 2
     assert cpu_tensor[2, 3] == 4
     assert cpu_tensor[4, 5] == -2
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_empty_host_view_lifetime(device):
+    torch.accelerator.set_device_index(torch.device(device).index)
+    torch.set_default_device(device)
+    cuda_view = empty_accelerator_view_from_host((4, 6), torch.int32)
+    assert cuda_view.device == torch.device(device)
+    assert cuda_view.shape == (4, 6)
+    assert cuda_view.dtype == torch.int32
+    assert cuda_view.is_contiguous()
+
+    cuda_view.copy_(torch.arange(24, dtype=torch.int32, device=device).view(4, 6))
+    retained_view = cuda_view.view(-1)
+    del cuda_view
+    gc.collect()
+
+    retained_view.add_(1)
+    torch.accelerator.synchronize()
+    expected = torch.arange(1, 25, dtype=torch.int32, device="cpu")
+    torch.testing.assert_close(retained_view.cpu(), expected)

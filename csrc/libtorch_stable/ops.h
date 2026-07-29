@@ -187,6 +187,10 @@ torch::stable::Tensor awq_dequantize(torch::stable::Tensor _kernel,
 torch::stable::Tensor get_cuda_view_from_cpu_tensor(
     torch::stable::Tensor& cpu_tensor);
 
+// Allocate mapped host memory and expose it as a contiguous CUDA tensor.
+torch::stable::Tensor empty_cuda_view_from_host(
+    torch::stable::Tensor& dtype_template, const std::vector<int64_t>& sizes);
+
 // Attention kernels (shared CUDA/ROCm)
 void merge_attn_states(
     torch::stable::Tensor& output,

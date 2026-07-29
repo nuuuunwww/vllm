@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from compressed_tensors.quantization import (
     QuantizationType,
 )
 
+from vllm.model_executor.layers.fused_moe.oracle import int_wna16
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     WNA16MoEBackend,
     _backend_incompatibility_reason,
@@ -30,6 +32,182 @@ from vllm.model_executor.layers.quantization.moe_wna16 import (
 
 def test_map_wna16_backend_supports_triton():
     assert map_wna16_backend("triton") == WNA16MoEBackend.TRITON
+
+
+@pytest.mark.parametrize(
+    (
+        "backend",
+        "quant_overrides",
+        "input_dtype",
+        "has_zero_points",
+        "has_bias",
+        "eligible",
+    ),
+    [
+        (WNA16MoEBackend.MARLIN, {}, None, False, False, True),
+        (WNA16MoEBackend.BATCHED_MARLIN, {}, None, False, False, False),
+        (WNA16MoEBackend.MARLIN, {"num_bits": 8}, None, False, False, False),
+        (WNA16MoEBackend.MARLIN, {"symmetric": False}, None, False, False, False),
+        (WNA16MoEBackend.MARLIN, {"group_size": 32}, None, False, False, False),
+        (WNA16MoEBackend.MARLIN, {}, torch.int8, False, False, False),
+        (
+            WNA16MoEBackend.MARLIN,
+            {"actorder": ActivationOrdering.GROUP},
+            None,
+            False,
+            False,
+            False,
+        ),
+        (WNA16MoEBackend.MARLIN, {}, None, True, False, False),
+        (WNA16MoEBackend.MARLIN, {}, None, False, True, False),
+    ],
+)
+def test_chunked_marlin_moe_repack_eligibility_is_narrow(
+    backend,
+    quant_overrides,
+    input_dtype,
+    has_zero_points,
+    has_bias,
+    eligible,
+):
+    quant_kwargs = {
+        "num_bits": 4,
+        "type": QuantizationType.INT,
+        "strategy": QuantizationStrategy.GROUP,
+        "symmetric": True,
+        "dynamic": False,
+        "group_size": 128,
+    }
+    quant_kwargs.update(quant_overrides)
+    quant_config = QuantizationArgs(**quant_kwargs)
+    optional_tensor = torch.empty(0)
+
+    reason = int_wna16._compressed_tensors_chunking_reason(
+        backend,
+        quant_config,
+        input_dtype,
+        optional_tensor if has_zero_points else None,
+        None,
+        optional_tensor if has_bias else None,
+        None,
+    )
+
+    assert (reason is None) is eligible
+
+
+def test_chunked_marlin_moe_repack_synchronizes_on_error(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        torch.accelerator,
+        "device_index",
+        lambda device_index: nullcontext(),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda device=None: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        int_wna16,
+        "empty_accelerator_view_from_host",
+        lambda shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+
+    def fail_repack(*args, **kwargs):
+        events.append("repack")
+        raise RuntimeError("repack failed")
+
+    monkeypatch.setattr(
+        int_wna16.ops,
+        "gptq_marlin_moe_repack_into",
+        fail_repack,
+    )
+
+    with pytest.raises(RuntimeError, match="repack failed"):
+        int_wna16._gptq_marlin_moe_repack_uva(
+            torch.zeros((2, 2, 3), dtype=torch.int32),
+            torch.empty((2, 0), dtype=torch.int32),
+            size_k=32,
+            size_n=3,
+            num_bits=4,
+            chunk_size=1,
+            is_a_8bit=False,
+        )
+
+    assert events == ["repack", "synchronize"]
+
+
+def test_compressed_tensors_process_preserves_chunked_uva_weights(monkeypatch):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe_wna16_marlin as ct_marlin,
+    )
+
+    method = object.__new__(ct_marlin.CompressedTensorsWNA16MarlinMoEMethod)
+    method.wna16_backend = WNA16MoEBackend.MARLIN
+    method.weight_quant = object()
+    method.marlin_input_dtype = None
+    method.symmetric = True
+    method.is_marlin = True
+    method.experts_cls = object
+    method.is_k_full = True
+    method.moe = object()
+    method.get_fused_moe_quant_config = lambda layer: object()
+
+    layer = torch.nn.Module()
+    parameter_names = (
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_scale",
+        "w13_weight_g_idx",
+        "w2_weight_g_idx",
+        "w13_g_idx_sort_indices",
+        "w2_g_idx_sort_indices",
+    )
+    for name in parameter_names:
+        layer.register_parameter(
+            name,
+            torch.nn.Parameter(torch.zeros(2), requires_grad=False),
+        )
+    layer._expert_routing_tables = lambda: (None, None, None)
+
+    w13 = torch.ones(2)
+    w2 = torch.full((2,), 2.0)
+    w13._vllm_is_uva_offloaded = True
+    w2._vllm_is_uva_offloaded = True
+    converted = (
+        w13,
+        w2,
+        torch.ones(2),
+        torch.ones(2),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    monkeypatch.setattr(
+        ct_marlin,
+        "convert_to_wna16_moe_kernel_format",
+        lambda **kwargs: converted,
+    )
+    monkeypatch.setattr(
+        ct_marlin,
+        "make_wna16_moe_kernel",
+        lambda **kwargs: object(),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight_packed._vllm_is_uva_offloaded
+    assert layer.w2_weight_packed._vllm_is_uva_offloaded
+    assert layer.w13_weight is layer.w13_weight_packed
+    assert layer.w2_weight is layer.w2_weight_packed
 
 
 @pytest.mark.parametrize(
